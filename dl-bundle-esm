@@ -1,0 +1,92 @@
+#!/usr/bin/env python3
+import sys
+import os
+import json
+import tempfile
+import shutil
+import subprocess
+from pathlib import Path
+
+
+def main():
+    # Check arguments
+    if len(sys.argv) != 3:
+        name = Path(sys.argv[0]).name
+        print(f"USAGE: {name} LIBRARY OUTDIR")
+        sys.exit(1)
+
+    library = sys.argv[1]
+    output_dir = Path(sys.argv[2])
+    cwd = Path.cwd()
+
+    if not os.path.exists(output_dir):
+        print(f"Error: Output directory {output_dir} does not exist")
+        sys.exit(1)
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        print(f"Installing {library}...")
+        subprocess.check_call(["npm", "install", library], cwd=tmp_dir)
+
+        package_json_path = Path(tmp_dir) / "node_modules" / library / "package.json"
+        if not package_json_path.exists():
+            print(f"Error: Could not find package.json for {library}")
+            sys.exit(1)
+
+        with open(package_json_path) as f:
+            package_data = json.load(f)
+
+        # Make a test file to get the entrypoint
+        with open(Path(tmp_dir) / "test.js", "w") as f:
+            f.write(f"""import * as lib from "{library}" """)
+        subprocess.check_call(
+            [
+                "esbuild",
+                "test.js",
+                "--bundle",
+                "--outfile=/dev/null",
+                "--metafile=meta.json",
+            ],
+            cwd=tmp_dir,
+        )
+
+        with open(Path(tmp_dir) / "meta.json") as f:
+            meta_data = json.load(f)
+            entrypoint = meta_data["inputs"]["test.js"]["imports"][0]["path"]
+
+        print("Using entrypoint:", entrypoint)
+        version = package_data.get("version", "unknown")
+        output_file = output_dir / f"{library.split('/')[-1]}-{version}.js"
+
+        subprocess.check_call(
+            [
+                "esbuild",
+                entrypoint,
+                "--format=esm",
+                "--bundle",
+                f"--outfile={cwd / output_file}",
+            ],
+            cwd=tmp_dir,
+        )
+        print(
+            f"""Done!
+
+Preload the module:
+<link rel="modulepreload" href="{output_file}">
+
+Importmap:
+<script type="importmap">
+{{
+  "imports": {{
+    "{library}": "{output_file}"
+  }}
+}}
+</script>
+
+Import in your script:
+import * as {library.split("/")[-1]} from "./{output_file}";
+"""
+        )
+
+
+if __name__ == "__main__":
+    main()
