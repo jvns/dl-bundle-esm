@@ -8,85 +8,107 @@ import subprocess
 from pathlib import Path
 
 
-def main():
-    # Check arguments
-    if len(sys.argv) != 3:
-        name = Path(sys.argv[0]).name
-        print(f"USAGE: {name} LIBRARY OUTDIR")
+def build_esm(cwd, library, libraries, tmp_dir, output_dir):
+    # Make a test file to get the entrypoint
+    with open(Path(tmp_dir) / "test.js", "w") as f:
+        f.write(f"""import * as lib from "{library}" """)
+    subprocess.check_call(
+        [
+            "esbuild",
+            "test.js",
+            "--bundle",
+            "--outfile=/dev/null",
+            "--metafile=meta.json",
+        ],
+        cwd=tmp_dir,
+    )
+
+    with open(Path(tmp_dir) / "meta.json") as f:
+        meta_data = json.load(f)
+        entrypoint = meta_data["inputs"]["test.js"]["imports"][0]["path"]
+
+    print("Using entrypoint:", entrypoint)
+
+    package_json_path = Path(tmp_dir) / "node_modules" / library / "package.json"
+    if not package_json_path.exists():
+        print(f"Error: Could not find package.json for {library}")
         sys.exit(1)
-
-    library = sys.argv[1]
-    output_dir = Path(sys.argv[2])
-    cwd = Path.cwd()
-
-    if not os.path.exists(output_dir):
-        print(f"Error: Output directory {output_dir} does not exist")
-        sys.exit(1)
-
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        print(f"Installing {library}...")
-        subprocess.check_call(["npm", "install", library], cwd=tmp_dir)
-
-        package_json_path = Path(tmp_dir) / "node_modules" / library / "package.json"
-        if not package_json_path.exists():
-            print(f"Error: Could not find package.json for {library}")
-            sys.exit(1)
-
-        with open(package_json_path) as f:
-            package_data = json.load(f)
-
-        # Make a test file to get the entrypoint
-        with open(Path(tmp_dir) / "test.js", "w") as f:
-            f.write(f"""import * as lib from "{library}" """)
-        subprocess.check_call(
-            [
-                "esbuild",
-                "test.js",
-                "--bundle",
-                "--outfile=/dev/null",
-                "--metafile=meta.json",
-            ],
-            cwd=tmp_dir,
-        )
-
-        with open(Path(tmp_dir) / "meta.json") as f:
-            meta_data = json.load(f)
-            entrypoint = meta_data["inputs"]["test.js"]["imports"][0]["path"]
-
-        print("Using entrypoint:", entrypoint)
+    with open(package_json_path) as f:
+        package_data = json.load(f)
         version = package_data.get("version", "unknown")
-        output_file = output_dir / f"{library.split('/')[-1]}-{version}.js"
+    output_file = output_dir / f"{library.replace('/', '-')}-{version}.js"
 
-        subprocess.check_call(
-            [
-                "esbuild",
-                entrypoint,
-                "--sourcemap",
-                "--format=esm",
-                "--bundle",
-                f"--outfile={cwd / output_file}",
-            ],
-            cwd=tmp_dir,
-        )
-        print(
-            f"""Done!
+    other_libraries = [lib for lib in libraries if lib != library]
+    external_args = ["--external:" + lib for lib in other_libraries]
 
-Preload the module:
-<link rel="modulepreload" href="{output_file}">
+    subprocess.check_call(
+        [
+            "esbuild",
+            entrypoint,
+            "--sourcemap",
+            "--format=esm",
+            "--bundle",
+            f"--outfile={cwd / output_file}",
+        ]
+        + external_args,
+        cwd=tmp_dir,
+    )
+    return output_file
 
+
+def print_output_usage(outputs):
+    preload = "\n".join(
+        [f'<link rel="modulepreload" href="{output}">' for output in outputs.values()]
+    )
+    importmap = ",\n".join(
+        [f'    "{library}": "./{output}"' for library, output in outputs.items()]
+    )
+    js_imports = "\n".join(
+        [
+            f'import * as {library.split("/")[-1]} from "{library}";'
+            for library in outputs.keys()
+        ]
+    )
+    print(
+        f"""Done!
+
+Preload the modules:
+{preload}
 Importmap:
 <script type="importmap">
 {{
   "imports": {{
-    "{library}": "{output_file}"
+{importmap}
   }}
 }}
 </script>
 
 Import in your script:
-import * as {library.split("/")[-1]} from "./{output_file}";
+{js_imports}
 """
-        )
+    )
+
+
+def main():
+    # Check arguments
+    if len(sys.argv) < 3:
+        name = Path(sys.argv[0]).name
+        print(f"USAGE: {name} LIBRARY... OUTDIR")
+        sys.exit(1)
+
+    libraries = sys.argv[1:-1]
+    output_dir = Path(sys.argv[-1])
+    if not os.path.exists(output_dir):
+        print(f"Error: Output directory {output_dir} does not exist")
+        sys.exit(1)
+    cwd = Path.cwd()
+    outputs = {}
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        subprocess.check_call(["npm", "install"] + libraries, cwd=tmp_dir)
+        for library in libraries:
+            outputs[library] = build_esm(cwd, library, libraries, tmp_dir, output_dir)
+
+    print_output_usage(outputs)
 
 
 if __name__ == "__main__":
